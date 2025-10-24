@@ -2,7 +2,6 @@ services:
   - type: web
     name: pmcrms-api
     env: dotnet
-    rootDir: BACKEND_PMC
     buildCommand: dotnet publish -c Release -o out
     startCommand: dotnet out/MyWebApp.dll
     plan: free

@@ -1632,7 +1632,10 @@ namespace MyWebApp.Api.Services
                         ApplicationStage.APPROVED,
                         "CityEngineer");
 
-                    _logger.LogInformation("Applied City Engineer digital signature on certificate for application {ApplicationId} by officer {OfficerId}. Application is now APPROVED.",
+                    // Send completion documents (certificate, challan, recommended form) to the user
+                    await SendApplicationCompletionDocumentsAsync(application);
+
+                    _logger.LogInformation("Applied City Engineer digital signature on certificate for application {ApplicationId} by officer {OfficerId}. Application is now APPROVED and completion documents sent to user.",
                         model.ApplicationId, model.OfficerId);
                 }
 
@@ -1643,6 +1646,212 @@ namespace MyWebApp.Api.Services
                 _logger.LogError(ex, "Error applying digital signature on certificate for application {ApplicationId}", model.ApplicationId);
                 throw;
             }
+        }
+
+        private async Task SendApplicationCompletionDocumentsAsync(Application application)
+        {
+            try
+            {
+                if (application.Applicant == null) return;
+
+                _logger.LogInformation("Starting to send completion documents for application {ApplicationId}", application.Id);
+
+                // Prepare attachments list
+                var attachments = new List<EmailAttachment>();
+
+                // Add certificate if available
+                if (!string.IsNullOrEmpty(application.CertificatePath))
+                {
+                    try
+                    {
+                        var certificateBytes = await _fileService.ReadFileAsync(application.CertificatePath);
+                        attachments.Add(new EmailAttachment
+                        {
+                            FileName = $"Certificate_{application.ApplicationNumber}.pdf",
+                            Content = certificateBytes,
+                            ContentType = "application/pdf"
+                        });
+                        _logger.LogInformation("Certificate attachment added for application {ApplicationId}", application.Id);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to attach certificate for application {ApplicationId}", application.Id);
+                    }
+                }
+
+                // Add challan if available
+                if (!string.IsNullOrEmpty(application.ChallanPath))
+                {
+                    try
+                    {
+                        var challanBytes = await _fileService.ReadFileAsync(application.ChallanPath);
+                        attachments.Add(new EmailAttachment
+                        {
+                            FileName = $"Challan_{application.ApplicationNumber}.pdf",
+                            Content = challanBytes,
+                            ContentType = "application/pdf"
+                        });
+                        _logger.LogInformation("Challan attachment added for application {ApplicationId}", application.Id);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to attach challan for application {ApplicationId}", application.Id);
+                    }
+                }
+
+                // Add recommended form if available
+                if (!string.IsNullOrEmpty(application.RecommendedFormPath))
+                {
+                    try
+                    {
+                        var recommendedFormBytes = await _fileService.ReadFileAsync(application.RecommendedFormPath);
+                        attachments.Add(new EmailAttachment
+                        {
+                            FileName = $"RecommendedForm_{application.ApplicationNumber}.pdf",
+                            Content = recommendedFormBytes,
+                            ContentType = "application/pdf"
+                        });
+                        _logger.LogInformation("Recommended form attachment added for application {ApplicationId}", application.Id);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to attach recommended form for application {ApplicationId}", application.Id);
+                    }
+                }
+
+                // Create completion email content
+                var emailSubject = $"Application Approved - Documents Ready for Download - {application.ApplicationNumber}";
+                var emailBody = GetApplicationCompletionEmailTemplate(application, attachments.Count);
+
+                // Send email with attachments
+                await _emailService.SendEmailWithAttachmentsAsync(
+                    application.Applicant.EmailAddress,
+                    emailSubject,
+                    emailBody,
+                    attachments
+                );
+
+                _logger.LogInformation("Application completion documents email sent successfully to {Email} for application {ApplicationId} with {AttachmentCount} attachments",
+                    application.Applicant.EmailAddress, application.Id, attachments.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error sending application completion documents for application {ApplicationId}", application.Id);
+            }
+        }
+
+        private string GetApplicationCompletionEmailTemplate(Application application, int attachmentCount)
+        {
+            var positionDisplayName = application.PositionType switch
+            {
+                PositionType.Architect => "Architect",
+                PositionType.StructuralEngineer => "Structural Engineer",
+                PositionType.LicenceEngineer => "Licence Engineer",
+                PositionType.Supervisor1 => "Supervisor (Category 1)",
+                PositionType.Supervisor2 => "Supervisor (Category 2)",
+                _ => "Professional"
+            };
+
+            return $@"<!DOCTYPE html>
+<html lang=""en"">
+<head>
+    <meta charset=""UTF-8"">
+    <meta name=""viewport"" content=""width=device-width, initial-scale=1.0"">
+    <title>Application Approved - Documents Ready</title>
+    <style>
+        body {{ font-family: 'Arial', sans-serif; background-color: #f8f9fa; margin: 0; padding: 20px; }}
+        .container {{ max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }}
+        .header {{ background-color: #28a745; color: white; padding: 25px; text-align: center; }}
+        .header h1 {{ margin: 0; font-size: 24px; }}
+        .header p {{ margin: 5px 0 0 0; font-size: 14px; opacity: 0.9; }}
+        .content {{ padding: 30px; }}
+        .success-badge {{ background-color: #d4edda; color: #155724; padding: 15px; border-radius: 6px; margin: 20px 0; border-left: 4px solid #28a745; }}
+        .certificate-info {{ background-color: #f8f9fa; padding: 20px; border-radius: 6px; margin: 20px 0; }}
+        .document-list {{ background-color: #e9ecef; padding: 15px; border-radius: 6px; margin: 20px 0; }}
+        .document-item {{ display: flex; align-items: center; padding: 8px 0; border-bottom: 1px solid #dee2e6; }}
+        .document-item:last-child {{ border-bottom: none; }}
+        .document-icon {{ color: #dc3545; margin-right: 10px; font-weight: bold; }}
+        .important-note {{ background-color: #fff3cd; color: #856404; padding: 15px; border-radius: 6px; margin: 20px 0; border-left: 4px solid #ffc107; }}
+        .footer {{ background-color: #6c757d; color: white; padding: 20px; text-align: center; font-size: 12px; }}
+        .contact-info {{ background-color: #e3f2fd; padding: 15px; border-radius: 6px; margin: 20px 0; }}
+        .btn {{ display: inline-block; padding: 12px 24px; background-color: #007bff; color: white; text-decoration: none; border-radius: 4px; margin: 10px 0; }}
+    </style>
+</head>
+<body>
+    <div class=""container"">
+        <div class=""header"">
+            <h1>🎉 Congratulations! Application Approved</h1>
+            <p>PMCRMS - Pune Municipal Corporation</p>
+        </div>
+        <div class=""content"">
+            <p>Dear <strong>{application.FirstName} {application.LastName}</strong>,</p>
+            
+            <div class=""success-badge"">
+                <h3 style=""margin: 0; color: #155724;"">✅ Your Application Has Been Successfully Approved!</h3>
+            </div>
+            
+            <p>We are pleased to inform you that your application <strong>{application.ApplicationNumber}</strong> for <strong>{positionDisplayName}</strong> registration has been successfully approved by the Pune Municipal Corporation.</p>
+            
+            <div class=""certificate-info"">
+                <h4>📋 Application Details:</h4>
+                <p><strong>Application Number:</strong> {application.ApplicationNumber}</p>
+                <p><strong>Position:</strong> {positionDisplayName}</p>
+                <p><strong>Certificate Number:</strong> {application.CertificateNumber ?? "Generated"}</p>
+                <p><strong>Approval Date:</strong> {DateTime.UtcNow:dd/MM/yyyy}</p>
+                <p><strong>Status:</strong> <span style=""color: #28a745; font-weight: bold;"">APPROVED</span></p>
+            </div>
+            
+            {(attachmentCount > 0 ? $@"
+            <div class=""document-list"">
+                <h4>📎 Documents Attached ({attachmentCount} files):</h4>
+                <div class=""document-item"">
+                    <span class=""document-icon"">📄</span>
+                    <strong>Official Certificate</strong> - Your digitally signed professional certificate
+                </div>
+                <div class=""document-item"">
+                    <span class=""document-icon"">🧾</span>
+                    <strong>Payment Challan</strong> - Receipt of payment made for the application
+                </div>
+                <div class=""document-item"">
+                    <span class=""document-icon"">📝</span>
+                    <strong>Recommended Form</strong> - Digitally signed application form
+                </div>
+            </div>
+            " : @"
+            <div class=""important-note"">
+                <h4>⚠️ Document Availability:</h4>
+                <p>Your documents are being prepared and will be available for download from your PMCRMS account shortly. You will receive another notification once they are ready.</p>
+            </div>
+            ")}
+            
+            <div class=""important-note"">
+                <h4>🔒 Important Security Information:</h4>
+                <p>All attached documents are digitally signed and verified by the Pune Municipal Corporation. These documents serve as official proof of your professional registration and should be kept secure.</p>
+            </div>
+            
+            <div class=""contact-info"">
+                <h4>📞 Need Help or Have Questions?</h4>
+                <p><strong>PMC Registration Department</strong></p>
+                <p>Email: registration@pmc.gov.in</p>
+                <p>Phone: +91-20-XXXX-XXXX</p>
+                <p>Office Hours: Monday to Friday, 10:00 AM to 5:30 PM</p>
+            </div>
+            
+            <p>You can also log in to your PMCRMS account to download these documents at any time and track your application history.</p>
+            
+            <p>Thank you for choosing PMCRMS services. We wish you success in your professional endeavors!</p>
+            
+            <p>Best regards,<br />
+            <strong>Pune Municipal Corporation</strong><br />
+            Registration Management System</p>
+        </div>
+        <div class=""footer"">
+            <p>&copy; 2025 Pune Municipal Corporation. All rights reserved.</p>
+            <p>This is an automated email. Please keep this email and attachments for your records.</p>
+        </div>
+    </div>
+</body>
+</html>";
         }
 
 

@@ -223,6 +223,65 @@ namespace MyWebApp.Controllers
             }
         }
 
+        [HttpPost("apply-certificate-signature")]
+        [Authorize]
+        public async Task<IActionResult> ApplyCertificateSignature([FromBody] ApplyCertificateSignatureViewModel model)
+        {
+            try
+            {
+                if (!ModelState.IsValid)
+                {
+                    return BadRequest(ModelState);
+                }
+
+                var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+                if (string.IsNullOrEmpty(userId))
+                {
+                    return Unauthorized("User not authenticated");
+                }
+
+                // Set officer ID to current user
+                model.OfficerId = userId;
+
+                // Get current user role to customize response message
+                var currentUser = await _applicationService.GetApplicationByIdAsync(model.ApplicationId.ToString(), userId);
+                var userRole = User.FindFirst(ClaimTypes.Role)?.Value;
+
+                var result = await _applicationService.ApplyCertificateSignatureAsync(model);
+                if (!result)
+                {
+                    return BadRequest("Failed to apply digital signature on certificate");
+                }
+
+                // Customize message based on user role
+                var message = userRole switch
+                {
+                    "ExecutiveEngineer" => "Executive Engineer digital signature applied successfully on certificate. Certificate forwarded to City Engineer for final signature.",
+                    "CityEngineer" => "City Engineer digital signature applied successfully on certificate. Application is now APPROVED and complete.",
+                    _ => "Digital signature applied successfully on certificate"
+                };
+
+                return Ok(new
+                {
+                    success = true,
+                    message = message
+                });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return BadRequest(new { success = false, message = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new
+                {
+                    success = false,
+                    message = "An error occurred while applying digital signature on certificate",
+                    error = ex.Message
+                });
+            }
+        }
+
         [HttpPost("schedule-appointment")]
         [Authorize]
         public async Task<IActionResult> ScheduleAppointment([FromBody] ScheduleAppointmentRequest model)

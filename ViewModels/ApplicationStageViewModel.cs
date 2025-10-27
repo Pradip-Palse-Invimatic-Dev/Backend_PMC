@@ -41,6 +41,18 @@ namespace MyWebApp.ViewModels
         public string OfficerId { get; set; } = string.Empty;
     }
 
+    public class ApplyCertificateSignatureViewModel
+    {
+        [Required]
+        public Guid ApplicationId { get; set; }
+
+        [Required]
+        public string Otp { get; set; } = string.Empty;
+
+        [Required]
+        public string OfficerId { get; set; } = string.Empty;
+    }
+
     public class StageUpdateResponse
     {
         public bool IsSuccess { get; set; }

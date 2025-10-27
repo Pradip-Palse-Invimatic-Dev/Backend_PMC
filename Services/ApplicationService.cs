@@ -228,7 +228,7 @@ namespace MyWebApp.Api.Services
         {
             // Check if role matches the required stage
             bool stageMatches = role switch
-              {
+            {
                 "CityEngineer" => currentStage == ApplicationStage.CITY_ENGINEER_PENDING || currentStage == ApplicationStage.CITY_ENGINEER_SIGN_PENDING,
                 "ExecutiveEngineer" => currentStage == ApplicationStage.EXECUTIVE_ENGINEER_PENDING || currentStage == ApplicationStage.EXECUTIVE_ENGINEER_SIGN_PENDING,
                 "Clerk" => currentStage == ApplicationStage.CLERK_PENDING,
@@ -1449,6 +1449,200 @@ namespace MyWebApp.Api.Services
 
             return validTransitions.ContainsKey(currentStage) &&
                    validTransitions[currentStage].Contains(newStage);
+        }
+
+        public async Task<bool> ApplyCertificateSignatureAsync(ApplyCertificateSignatureViewModel model)
+        {
+            try
+            {
+                // Get application with related data
+                var application = await _context.Applications
+                    .Include(a => a.PermanentAddress)
+                    .Include(a => a.CurrentAddress)
+                    .Include(a => a.Applicant)
+                    .FirstOrDefaultAsync(a => a.Id == model.ApplicationId);
+
+                if (application == null)
+                {
+                    throw new InvalidOperationException("Application not found");
+                }
+
+                // Validate application stage - should be EXECUTIVE_ENGINEER_SIGN_PENDING or CITY_ENGINEER_SIGN_PENDING
+                if (application.CurrentStage != ApplicationStage.EXECUTIVE_ENGINEER_SIGN_PENDING &&
+                    application.CurrentStage != ApplicationStage.CITY_ENGINEER_SIGN_PENDING)
+                {
+                    throw new InvalidOperationException($"Certificate signature can only be applied when application is in EXECUTIVE_ENGINEER_SIGN_PENDING or CITY_ENGINEER_SIGN_PENDING stage. Current stage: {application.CurrentStage}");
+                }
+
+                // Validate certificate is generated and path exists
+                if (!application.IsCertificateGenerated || string.IsNullOrEmpty(application.CertificatePath))
+                {
+                    throw new InvalidOperationException("Certificate must be generated before applying digital signature. Please ensure certificate is generated and path is available.");
+                }
+
+                // Validate payment is complete
+                if (!application.IsPaymentComplete)
+                {
+                    throw new InvalidOperationException("Payment must be completed before applying certificate signature");
+                }
+
+                // Get officer for KeyLabel and user role
+                var officer = await _context.Officers
+                    .Include(o => o.User)
+                    .FirstOrDefaultAsync(o => o.UserId == model.OfficerId);
+
+                if (officer == null || string.IsNullOrEmpty(officer.KeyLabel))
+                {
+                    throw new InvalidOperationException("Officer KeyLabel not found");
+                }
+
+                if (officer.User == null || string.IsNullOrEmpty(officer.User.Role))
+                {
+                    throw new InvalidOperationException("Officer role not found");
+                }
+
+                // Validate officer has permission to sign at current stage
+                if (application.CurrentStage == ApplicationStage.EXECUTIVE_ENGINEER_SIGN_PENDING && officer.User.Role != "ExecutiveEngineer")
+                {
+                    throw new InvalidOperationException("Only Executive Engineer can apply digital signature on certificates at EXECUTIVE_ENGINEER_SIGN_PENDING stage");
+                }
+                else if (application.CurrentStage == ApplicationStage.CITY_ENGINEER_SIGN_PENDING && officer.User.Role != "CityEngineer")
+                {
+                    throw new InvalidOperationException("Only City Engineer can apply digital signature on certificates at CITY_ENGINEER_SIGN_PENDING stage");
+                }
+
+                // Read certificate PDF file
+                var certificateBytes = await _fileService.ReadFileAsync(application.CertificatePath);
+                var certificateBase64 = Convert.ToBase64String(certificateBytes);
+
+                // Prepare HSM signature parameters for certificate
+                string transaction = application.CurrentStage == ApplicationStage.EXECUTIVE_ENGINEER_SIGN_PENDING ?
+                    $"{application.Id}_CERT_EE" : $"{application.Id}_CERT_CE";
+                string keyLabel = officer.KeyLabel;
+                string coordinates = GetSignatureCoordinatesByRole(officer.User.Role); // Role-specific coordinates
+                string otp = model.Otp;
+
+                // Create SOAP envelope for HSM call to sign certificate
+                var soapEnvelope = $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
+<s:Body xmlns:xsi=""http://www.w3.org/2001/XMLSchema-instance"" xmlns:xsd=""http://www.w3.org/2001/XMLSchema"">
+<signPdf xmlns=""http://ds.ws.emas/"">
+<arg0 xmlns="""">{transaction}</arg0>
+<arg1 xmlns="""">{keyLabel}</arg1>
+<arg2 xmlns="""">{certificateBase64}</arg2>
+<arg3 xmlns=""""/>
+<arg4 xmlns="""">{coordinates}</arg4>
+<arg5 xmlns="""">last</arg5>
+<arg6 xmlns=""""/>
+<arg7 xmlns=""""/>
+<arg8 xmlns="""">True</arg8>
+<arg9 xmlns="""">{otp}</arg9>
+<arg10 xmlns="""">single</arg10>
+<arg11 xmlns=""""/><arg12 xmlns=""""/>
+</signPdf>
+</s:Body>
+</s:Envelope>";
+
+                // Call HSM service for certificate digital signature
+                var content = new StringContent(soapEnvelope, Encoding.UTF8, "application/xml");
+                using var httpClient = _httpClientFactory.CreateClient("HSM_SIGN");
+                var response = await httpClient.PostAsync("services/dsverifyWS", content);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    throw new Exception($"HSM certificate signature API call failed with status: {response.StatusCode}");
+                }
+
+                var result = await response.Content.ReadAsStringAsync();
+                _logger.LogInformation("HSM Certificate Signature Response: {Response}", result);
+
+                // Check if signature was successful
+                if (result.Contains($"{transaction}~FAILURE~failure"))
+                {
+                    _logger.LogError("HSM certificate signature failed: {Result}", result);
+                    throw new Exception("Certificate digital signature failed. Please verify OTP and try again.");
+                }
+
+                // Process successful signature response
+                var processedResult = result
+                    .Replace("<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">", "")
+                    .Replace("<soap:Body><ns2:signPdfResponse xmlns:ns2=\"http://ds.ws.emas/\">", "")
+                    .Replace($"<return>{transaction}~SUCCESS~", "")
+                    .Replace("</return></ns2:signPdfResponse></soap:Body></soap:Envelope>", "");
+
+                // Convert back to PDF bytes and save signed certificate
+                var signedCertificateBytes = Convert.FromBase64String(processedResult);
+                var currentStage = application.CurrentStage;
+                var signedCertificateFileName = currentStage == ApplicationStage.EXECUTIVE_ENGINEER_SIGN_PENDING ?
+                    $"{application.Id}_Certificate_EE_Signed.pdf" : $"{application.Id}_Certificate_Final_Signed.pdf";
+                var signedCertificatePath = await _fileService.SaveFileAsync(signedCertificateFileName, signedCertificateBytes);
+
+                // Update application with signed certificate path
+                application.CertificatePath = signedCertificatePath;
+                application.LastModifiedAt = DateTime.UtcNow;
+                application.LastModifiedBy = model.OfficerId;
+
+                // Determine next stage based on current stage
+                var previousStage = application.CurrentStage;
+                if (application.CurrentStage == ApplicationStage.EXECUTIVE_ENGINEER_SIGN_PENDING)
+                {
+                    // Move to City Engineer signature stage
+                    application.CurrentStage = ApplicationStage.CITY_ENGINEER_SIGN_PENDING;
+                }
+                else if (application.CurrentStage == ApplicationStage.CITY_ENGINEER_SIGN_PENDING)
+                {
+                    // Final approval - application is complete
+                    application.CurrentStage = ApplicationStage.APPROVED;
+                    application.Status = ApplicationStatus.Completed;
+                    application.ApprovalDate = DateTime.UtcNow;
+                }
+
+                _context.Applications.Update(application);
+                await _context.SaveChangesAsync();
+
+                // Handle post-signature actions based on stage
+                if (previousStage == ApplicationStage.EXECUTIVE_ENGINEER_SIGN_PENDING)
+                {
+                    // Get City Engineer officers for assignment
+                    var cityEngineerOfficers = await GetOfficersByRole("CityEngineer");
+
+                    if (cityEngineerOfficers.Any())
+                    {
+                        // Create tasks for City Engineer officers
+                        foreach (var cityEngineer in cityEngineerOfficers)
+                        {
+                            _logger.LogInformation("Certificate signature task assigned to City Engineer {OfficerId} for application {ApplicationId}",
+                                cityEngineer.Id, application.Id);
+                        }
+
+                        // Send notification email to applicant about stage update
+                        await SendApplicationStageUpdateEmailAsync(application,
+                            ApplicationStage.EXECUTIVE_ENGINEER_SIGN_PENDING,
+                            ApplicationStage.CITY_ENGINEER_SIGN_PENDING,
+                            "ExecutiveEngineer");
+                    }
+
+                    _logger.LogInformation("Applied Executive Engineer digital signature on certificate for application {ApplicationId} by officer {OfficerId}",
+                        model.ApplicationId, model.OfficerId);
+                }
+                else if (previousStage == ApplicationStage.CITY_ENGINEER_SIGN_PENDING)
+                {
+                    // Send final approval notification to applicant
+                    await SendApplicationStageUpdateEmailAsync(application,
+                        ApplicationStage.CITY_ENGINEER_SIGN_PENDING,
+                        ApplicationStage.APPROVED,
+                        "CityEngineer");
+
+                    _logger.LogInformation("Applied City Engineer digital signature on certificate for application {ApplicationId} by officer {OfficerId}. Application is now APPROVED.",
+                        model.ApplicationId, model.OfficerId);
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error applying digital signature on certificate for application {ApplicationId}", model.ApplicationId);
+                throw;
+            }
         }
 
 
